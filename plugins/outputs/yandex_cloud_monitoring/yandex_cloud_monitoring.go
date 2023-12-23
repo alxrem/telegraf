@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
@@ -15,25 +17,50 @@ import (
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/influxdata/telegraf/selfstat"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 //go:embed sample.conf
 var sampleConfig string
 
+type ServiceAccountKey struct {
+	ID               string `json:"id"`
+	ServiceAccountID string `json:"service_account_id"`
+	PrivateKey       string `json:"private_key"`
+}
+
+func ReadServiceAccountKey(fileName string) (*ServiceAccountKey, error) {
+	key := &ServiceAccountKey{}
+
+	keyJSON, err := os.ReadFile(fileName)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(keyJSON, key); err != nil {
+		return nil, err
+	}
+
+	return key, err
+}
+
 // YandexCloudMonitoring allows publishing of metrics to the Yandex Cloud Monitoring custom metrics
 // service
 type YandexCloudMonitoring struct {
-	Timeout     config.Duration `toml:"timeout"`
-	EndpointURL string          `toml:"endpoint_url"`
-	Service     string          `toml:"service"`
+	Timeout               config.Duration `toml:"timeout"`
+	EndpointURL           string          `toml:"endpoint_url"`
+	Service               string          `toml:"service"`
+	ServiceAccountKeyFile string          `toml:"service_account_key_file"`
+	FolderID              string          `toml:"folder_id"`
 
 	Log telegraf.Logger
 
 	MetadataTokenURL       string
 	MetadataFolderURL      string
-	FolderID               string
 	IAMToken               string
 	IamTokenExpirationTime time.Time
+	ServiceAccountKey      *ServiceAccountKey
 
 	client *http.Client
 
@@ -68,6 +95,8 @@ const (
 	//nolint:gosec // G101: Potential hardcoded credentials - false positive
 	defaultMetadataTokenURL  = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 	defaultMetadataFolderURL = "http://169.254.169.254/computeMetadata/v1/yandex/folder-id"
+
+	iamTokenURL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
 )
 
 func (*YandexCloudMonitoring) SampleConfig() string {
@@ -100,7 +129,14 @@ func (a *YandexCloudMonitoring) Connect() error {
 	}
 
 	var err error
-	a.FolderID, err = a.getFolderIDFromMetadata()
+	if a.ServiceAccountKeyFile == "" {
+		a.FolderID, err = a.getFolderIDFromMetadata()
+	} else {
+		a.ServiceAccountKey, err = ReadServiceAccountKey(a.ServiceAccountKeyFile)
+		if err == nil {
+			err = a.refreshTokenByJWT()
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -221,12 +257,9 @@ func (a *YandexCloudMonitoring) send(body []byte) error {
 	req.Header.Set("Content-Type", "application/json")
 	isTokenExpired := !a.IamTokenExpirationTime.After(time.Now())
 	if a.IAMToken == "" || isTokenExpired {
-		token, expiresIn, err := a.getIAMTokenFromMetadata()
-		if err != nil {
+		if err := a.refreshToken(); err != nil {
 			return err
 		}
-		a.IamTokenExpirationTime = time.Now().Add(time.Duration(expiresIn) * time.Second)
-		a.IAMToken = token
 	}
 	req.Header.Set("Authorization", "Bearer "+a.IAMToken)
 
@@ -242,6 +275,79 @@ func (a *YandexCloudMonitoring) send(body []byte) error {
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("failed to write batch: [%v] %s", resp.StatusCode, resp.Status)
 	}
+
+	return nil
+}
+
+func (a *YandexCloudMonitoring) refreshToken() error {
+	if a.ServiceAccountKeyFile == "" {
+		return a.refreshTokenFromMetadata()
+	}
+	return a.refreshTokenByJWT()
+}
+
+func (a *YandexCloudMonitoring) refreshTokenFromMetadata() error {
+	token, expiresIn, err := a.getIAMTokenFromMetadata()
+	if err != nil {
+		return err
+	}
+	a.IamTokenExpirationTime = time.Now().Add(time.Duration(expiresIn) * time.Second)
+	a.IAMToken = token
+	return nil
+}
+
+type getIAMTokenResponse struct {
+	IAMToken  string    `json:"iamToken"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+func (a *YandexCloudMonitoring) refreshTokenByJWT() error {
+	claims := jwt.RegisteredClaims{
+		Issuer:    a.ServiceAccountKey.ServiceAccountID,
+		ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(1 * time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
+		NotBefore: jwt.NewNumericDate(time.Now().UTC()),
+		Audience:  []string{iamTokenURL},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodPS256, claims)
+	token.Header["kid"] = a.ServiceAccountKey.ID
+
+	signed, err := token.SignedString(a.ServiceAccountKey.PrivateKey)
+	if err != nil {
+		return err
+	}
+
+	body := strings.NewReader(fmt.Sprintf(`{"jwt": "%s"`, signed))
+	req, err := http.NewRequest("POST", iamTokenURL, body)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+		return fmt.Errorf("unable to fetch IAM token: [%s] %d", iamTokenURL, resp.StatusCode)
+	}
+
+	tokenBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	tokenResponse := &getIAMTokenResponse{}
+	if err := json.Unmarshal(tokenBody, tokenResponse); err != nil {
+		return err
+	}
+
+	a.IAMToken = tokenResponse.IAMToken
+	a.IamTokenExpirationTime = tokenResponse.ExpiresAt
 
 	return nil
 }
