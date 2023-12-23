@@ -3,6 +3,7 @@ package yandex_cloud_monitoring
 
 import (
 	"bytes"
+	"crypto/rsa"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -30,21 +31,6 @@ type ServiceAccountKey struct {
 	PrivateKey       string `json:"private_key"`
 }
 
-func ReadServiceAccountKey(fileName string) (*ServiceAccountKey, error) {
-	key := &ServiceAccountKey{}
-
-	keyJSON, err := os.ReadFile(fileName)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := json.Unmarshal(keyJSON, key); err != nil {
-		return nil, err
-	}
-
-	return key, err
-}
-
 // YandexCloudMonitoring allows publishing of metrics to the Yandex Cloud Monitoring custom metrics
 // service
 type YandexCloudMonitoring struct {
@@ -60,7 +46,10 @@ type YandexCloudMonitoring struct {
 	MetadataFolderURL      string
 	IAMToken               string
 	IamTokenExpirationTime time.Time
-	ServiceAccountKey      *ServiceAccountKey
+
+	ServiceAccountKeyID      string
+	ServiceAccountID         string
+	ServiceAccountPrivateKey *rsa.PrivateKey
 
 	client *http.Client
 
@@ -132,7 +121,7 @@ func (a *YandexCloudMonitoring) Connect() error {
 	if a.ServiceAccountKeyFile == "" {
 		a.FolderID, err = a.getFolderIDFromMetadata()
 	} else {
-		a.ServiceAccountKey, err = ReadServiceAccountKey(a.ServiceAccountKeyFile)
+		err := a.readServiceAccountKey()
 		if err == nil {
 			err = a.refreshTokenByJWT()
 		}
@@ -190,6 +179,25 @@ func (a *YandexCloudMonitoring) Write(metrics []telegraf.Metric) error {
 	}
 	body = append(jsonBytes, '\n')
 	return a.send(body)
+}
+
+func (a *YandexCloudMonitoring) readServiceAccountKey() error {
+	key := &ServiceAccountKey{}
+
+	keyJSON, err := os.ReadFile(a.ServiceAccountKeyFile)
+	if err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(keyJSON, key); err != nil {
+		return err
+	}
+
+	a.ServiceAccountKeyID = key.ID
+	a.ServiceAccountID = key.ServiceAccountID
+	a.ServiceAccountPrivateKey, err = jwt.ParseRSAPrivateKeyFromPEM([]byte(key.PrivateKey))
+
+	return err
 }
 
 func getResponseFromMetadata(c *http.Client, metadataURL string) ([]byte, error) {
@@ -303,7 +311,7 @@ type getIAMTokenResponse struct {
 
 func (a *YandexCloudMonitoring) refreshTokenByJWT() error {
 	claims := jwt.RegisteredClaims{
-		Issuer:    a.ServiceAccountKey.ServiceAccountID,
+		Issuer:    a.ServiceAccountID,
 		ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(1 * time.Hour)),
 		IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
 		NotBefore: jwt.NewNumericDate(time.Now().UTC()),
@@ -311,14 +319,14 @@ func (a *YandexCloudMonitoring) refreshTokenByJWT() error {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodPS256, claims)
-	token.Header["kid"] = a.ServiceAccountKey.ID
+	token.Header["kid"] = a.ServiceAccountKeyID
 
-	signed, err := token.SignedString(a.ServiceAccountKey.PrivateKey)
+	signed, err := token.SignedString(a.ServiceAccountPrivateKey)
 	if err != nil {
 		return err
 	}
 
-	body := strings.NewReader(fmt.Sprintf(`{"jwt": "%s"`, signed))
+	body := strings.NewReader(fmt.Sprintf(`{"jwt": %q}`, signed))
 	req, err := http.NewRequest("POST", iamTokenURL, body)
 	if err != nil {
 		return err
